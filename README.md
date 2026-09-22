@@ -29,7 +29,7 @@ Python background service that syncs Zettle card purchase transactions to Fireba
 - `structlog` — structured JSON logging
 - `apscheduler` — background job scheduling
 - `firebase-admin` — Firestore client
-- `click` — CLI commands for data seeding
+- `click` — CLI commands for management
 
 ## Environment Variables
 
@@ -61,26 +61,9 @@ uv sync
 uv run python -m beertracker
 ```
 
-## One-time Data Migration (Historical Zettle Data)
-
-The Zettle API no longer returns transactions before 2024-02-06. Historical data is stored in `data/`.
-
-```bash
-# 1. Seed historical card totals (from Java Map dump)
-BEERTRACKER_ZETTLE_ASSERTION_KEY=test \
-  uv run beertracker-cli seed-cards data/cards-16-10-2020-til-06-02-2024.txt
-
-# 2. Write the lastPurchaseHash so sync resumes at the correct point
-BEERTRACKER_ZETTLE_ASSERTION_KEY=test \
-  uv run beertracker-cli seed-state data/lastPurchaseHash-pr-06-02-24.txt
-```
-
 ## CLI Commands
 
 ```bash
-# Dry-run historical card seeding
-uv run beertracker-cli seed-cards data/cards-16-10-2020-til-06-02-2024.txt --dry-run
-
 # Inspect Firestore collections
 uv run beertracker-cli inspect --collection cards
 ```
@@ -111,12 +94,11 @@ beertracker/
 ├── core/              # Domain models, validators, mappers
 ├── firebase/          # Firestore client + repositories
 ├── __main__.py        # Service entry point
-├── cli.py             # Click CLI for data seeding
+├── cli.py             # Click CLI for management
 ├── config.py          # Pydantic Settings
 ├── logging_setup.py   # structlog JSON logging
 ├── scheduler.py       # APScheduler sync worker
 tests/                 # Unit tests
-data/                  # Historical seed data (do not commit)
 Dockerfile
 docker-compose.yml
 pyproject.toml         # uv project config
@@ -130,7 +112,7 @@ pyproject.toml         # uv project config
 | `CallAPI.java` + `PurchaseReader.java` | `api/client.py` | Pagination via `lastPurchaseHash`, robust retry |
 | `PurchaseMapper.java` | `core/mappers.py` | Filters `IZETTLE_CARD`, converts øre→kr, aggregates by card |
 | `Person.java` validators | `core/validators.py` | Card format, name format, amount validation |
-| `Filehandler.java` | `cli.py` seed commands | One-time Firestore seed from historical text files |
+| `Filehandler.java` | `cli.py` management commands | Legacy file handling (not needed for new installs) |
 | `Card.java` / `User.java` | `core/models.py` | Dataclasses for domain entities |
 | `FirestoreService.java` | `firebase/client.py` | Singleton Firebase Admin init |
 | `CardRepo.java` / `InfoRepo.java` | `firebase/repositories.py` | Firestore CRUD + atomic increment |
