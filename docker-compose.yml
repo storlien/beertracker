@@ -1,0 +1,25 @@
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  volumes:
+    - type: bind
+      source: ./firebase-service-account.json
+      target: /app/firebase-service-account.json
+      read_only: true
+
+services:
+  beertracker:
+    <<: *common
+    container_name: beertracker
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      - BEERTRACKER_FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
+    networks:
+      - beertracker-net
+
+networks:
+  beertracker-net:
+    driver: bridge
