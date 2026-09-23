@@ -146,6 +146,20 @@ class CardRepository:
             )
         return applied, skipped
 
+    def upsert_sum(self, card_number: str, total: float) -> None:
+        """Set or overwrite the sum for a card (used by CLI seeding).
+
+        Args:
+            card_number: 10-digit card identifier.
+            total: Absolute total amount in kroner.
+        """
+        now = datetime.now(timezone.utc)
+        self._col.document(card_number).set(
+            {"sum": round(total, 2), "updatedAt": now},
+            merge=True,
+        )
+        logger.info("Upserted card %s sum=%.2f", card_number, total)
+
     def get_all(self):
         """Iterate over all cards (generator)."""
         for doc in self._col.stream():

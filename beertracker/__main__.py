@@ -18,7 +18,11 @@ def main() -> None:
 
     logger.info("BeerTracker service starting...")
     logger.info("Log level: %s", settings.log_level)
-    logger.info("Sync interval: %s seconds", settings.sync_interval_seconds)
+    logger.info(
+        "Sync active/hibernate: %ds / %ds",
+        settings.sync_interval_active,
+        settings.sync_interval_hibernate,
+    )
     logger.info("Token refresh: %s minutes", settings.token_refresh_minutes)
 
     worker = SyncWorker()

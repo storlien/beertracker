@@ -18,7 +18,9 @@ class Settings(BaseSettings):
         zettle_client_id: OAuth client ID for Zettle API (LaBamba).
         zettle_assertion_key: JWT assertion key for Zettle OAuth (required).
         firebase_service_account_path: Path to Firebase service account JSON key file.
-        sync_interval_seconds: Interval between purchase sync jobs (default 60).
+        sync_interval_active: Interval between syncs when bar is active (seconds).
+        sync_interval_hibernate: Interval between syncs when idle (seconds).
+        sync_hibernate_after_minutes: Minutes of no activity to enter hibernation.
         token_refresh_minutes: Interval between token refresh jobs (default 30).
         log_level: Logging level (default INFO).
     """
@@ -26,7 +28,9 @@ class Settings(BaseSettings):
     zettle_client_id: str = ""
     zettle_assertion_key: str = ""
     firebase_service_account_path: str = "firebase-service-account.json"
-    sync_interval_seconds: int = 60
+    sync_interval_active: int = 10
+    sync_interval_hibernate: int = 180
+    sync_hibernate_after_minutes: int = 60
     token_refresh_minutes: int = 30
     log_level: str = "INFO"
 

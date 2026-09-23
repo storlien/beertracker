@@ -112,6 +112,76 @@ def inspect(collection: str) -> None:
         click.echo(f"  {doc.id}: {doc.to_dict()}")
 
 
+@cli.command("compute-leaderboard")
+def compute_leaderboard_cmd() -> None:
+    """Manually recompute leaderboard/top100 from Firestore data.
+
+    This is useful after running ``seed_cards`` or making bulk edits that
+    the real-time listener may not catch immediately.
+    """
+    import time
+
+    from beertracker.firebase.client import get_firestore_client
+    from beertracker.services.leaderboard_cache import LeaderboardCache
+    from beertracker.services.leaderboard_repo import LeaderboardRepository
+
+    db = get_firestore_client()
+    repo = LeaderboardRepository(db)
+    cache = LeaderboardCache(db, repo)
+
+    click.echo("Warming leaderboard cache from Firestore...")
+    cache.start()
+
+    # Give Firestore listeners a moment to populate
+    time.sleep(2)
+
+    click.echo("Recomputing leaderboard...")
+    cache._recompute_and_write()  # noqa: SLF001
+
+    doc = repo.get_top100()
+    entries = doc.get("entries", []) if doc else []
+    click.echo(f"Done! Top 100 written with {len(entries)} entries.")
+    for idx, e in enumerate(entries[:10], 1):
+        click.echo(f"  {idx}. {e['name']} — {e['sum']:.0f} kr")
+
+    cache.stop()
+
+
+@cli.command("compute-leaderboard")
+def compute_leaderboard_cmd() -> None:
+    """Manually recompute leaderboard/top100 from Firestore data.
+
+    This is useful after running ``seed_cards`` or making bulk edits that
+    the real-time listener may not catch immediately.
+    """
+    import time
+
+    from beertracker.firebase.client import get_firestore_client
+    from beertracker.services.leaderboard_cache import LeaderboardCache
+    from beertracker.services.leaderboard_repo import LeaderboardRepository
+
+    db = get_firestore_client()
+    repo = LeaderboardRepository(db)
+    cache = LeaderboardCache(db, repo)
+
+    click.echo("Warming leaderboard cache from Firestore...")
+    cache.start()
+
+    # Give Firestore listeners a moment to populate
+    time.sleep(2)
+
+    click.echo("Recomputing leaderboard...")
+    cache._recompute_and_write()  # noqa: SLF001
+
+    doc = repo.get_top100()
+    entries = doc.get("entries", []) if doc else []
+    click.echo(f"Done! Top 100 written with {len(entries)} entries.")
+    for idx, e in enumerate(entries[:10], 1):
+        click.echo(f"  {idx}. {e['name']} — {e['sum']:.0f} kr")
+
+    cache.stop()
+
+
 def _parse_java_map(content: str) -> dict[str, list[float]]:
     """Fallback parser for Java Map.toString() format.
 
@@ -163,4 +233,3 @@ def _parse_java_map(content: str) -> dict[str, list[float]]:
 def main() -> None:
     """Entry point for the CLI."""
     cli()
-

@@ -43,6 +43,25 @@ class Card:
 
 
 @dataclass
+class LeaderboardEntry:
+    """A single entry in the top-100 leaderboard.
+
+    Attributes:
+        entry_id: User ID for linked entries, card number for unlinked.
+        name: Display name (first + last name, or "Unknown").
+        is_user: Whether this entry represents a registered user.
+        total_sum: Cumulative amount in kroner.
+        card_ids: List of linked card numbers.
+    """
+
+    entry_id: str
+    name: str
+    is_user: bool
+    total_sum: float
+    card_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
 class User:
     """A tracked person (managed by the website).
 

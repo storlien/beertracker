@@ -14,12 +14,22 @@ from beertracker.config import get_settings
 from beertracker.core.mappers import aggregate_by_card, parse_purchases
 from beertracker.firebase.client import get_firestore_client
 from beertracker.firebase.repositories import CardRepository, StateRepository
+from beertracker.services.leaderboard_cache import LeaderboardCache
+from beertracker.services.leaderboard_repo import LeaderboardRepository
 
 logger = logging.getLogger(__name__)
 
+SYNC_JOB_ID = "sync_purchases"
+ADAPTIVE_CHECK_JOB_ID = "adaptive_check"
+
 
 class SyncWorker:
-    """Background worker that periodically syncs Zettle purchases to Firestore."""
+    """Background worker that periodically syncs Zettle purchases to Firestore.
+
+    Uses adaptive sync rate: active (fast) when bar is busy, hibernating (slow)
+    when idle. The leaderboard is kept in memory and updated via Firestore
+    listeners, so the frontend only reads a single ``leaderboard/top100`` doc.
+    """
 
     def __init__(self) -> None:
         self._token_manager = TokenManager()
@@ -27,9 +37,18 @@ class SyncWorker:
         self._db = get_firestore_client()
         self._card_repo = CardRepository(self._db)
         self._state_repo = StateRepository(self._db)
+        self._leaderboard_repo = LeaderboardRepository(self._db)
+        self._cache = LeaderboardCache(self._db, self._leaderboard_repo)
+
         self._scheduler = BackgroundScheduler()
         self._shutdown_event = threading.Event()
         self._sync_lock = threading.Lock()
+
+        self._current_interval: int | None = None
+
+    # ------------------------------------------------------------------
+    # Jobs
+    # ------------------------------------------------------------------
 
     def _job_sync_purchases(self) -> None:
         """Fetch newer purchases incrementally and commit each page to Firestore.
@@ -123,6 +142,37 @@ class SyncWorker:
         except Exception:
             logger.exception("Token refresh job failed")
 
+    def _job_adaptive_check(self) -> None:
+        """Adjust sync interval based on recent bar activity."""
+        settings = get_settings()
+        active = self._cache.has_activity(settings.sync_hibernate_after_minutes)
+
+        desired = (
+            settings.sync_interval_active
+            if active
+            else settings.sync_interval_hibernate
+        )
+
+        if self._current_interval != desired:
+            self._current_interval = desired
+            logger.info(
+                "Adaptive sync: %s mode → %ds interval",
+                "ACTIVE" if active else "HIBERNATE",
+                desired,
+            )
+            try:
+                self._scheduler.reschedule_job(
+                    SYNC_JOB_ID,
+                    trigger="interval",
+                    seconds=desired,
+                )
+            except Exception:
+                logger.exception("Failed to reschedule sync job")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     def start(self) -> None:
         """Configure and start the background scheduler."""
         settings = get_settings()
@@ -132,12 +182,19 @@ class SyncWorker:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self._signal_handler)
 
+        # Start leaderboard cache (attaches Firestore listeners)
+        self._cache.start()
+
+        # Determine initial interval based on activity
+        initial_interval = settings.sync_interval_active
+        self._current_interval = initial_interval
+
         # Schedule jobs
         self._scheduler.add_job(
             self._job_sync_purchases,
             "interval",
-            seconds=settings.sync_interval_seconds,
-            id="sync_purchases",
+            seconds=initial_interval,
+            id=SYNC_JOB_ID,
             replace_existing=True,
         )
         self._scheduler.add_job(
@@ -145,6 +202,13 @@ class SyncWorker:
             "interval",
             minutes=settings.token_refresh_minutes,
             id="refresh_token",
+            replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self._job_adaptive_check,
+            "interval",
+            seconds=60,  # Check mode every minute
+            id=ADAPTIVE_CHECK_JOB_ID,
             replace_existing=True,
         )
 
@@ -157,8 +221,9 @@ class SyncWorker:
 
         self._scheduler.start()
         logger.info(
-            "Scheduler started (sync every %ds, token refresh every %dm)",
-            settings.sync_interval_seconds,
+            "Scheduler started (sync every %ds, token refresh every %dm, "
+            "adaptive check every 60s)",
+            initial_interval,
             settings.token_refresh_minutes,
         )
 
@@ -180,6 +245,7 @@ class SyncWorker:
         self._shutdown_event.set()
         self._scheduler.shutdown(wait=True)
         self._zettle.close()
+        self._cache.stop()
         logger.info("SyncWorker shutdown complete")
 
     def _signal_handler(self, signum: int, _frame: Any) -> None:
