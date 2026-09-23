@@ -1,12 +1,12 @@
 # BeerTracker Backend Service
 
-Python background service that syncs Zettle card purchase transactions to Firebase Firestore. The website reads directly from Firestore — there is no REST API surface.
+Python background service that syncs Zettle card purchase transactions to Firebase Firestore.
 
 ---
 
 ## Architecture
 
-- **Pure background worker** (no REST API)
+- **Pure background worker**
 - **Zettle API** → Firestore `cards/` and `info/state` collections
 - **Leaderboard** is pre-computed in memory and written to `leaderboard/top100`
 - **Users** are created/managed by the website frontend, not this service
@@ -160,3 +160,5 @@ pyproject.toml            # uv project config
 - All secrets are injected via environment variables
 - The container runs as non-root (`appuser`)
 - No secrets are logged by the structured logger
+
+### Refactoring and further development done with OpenCode and Kimi K2.6
