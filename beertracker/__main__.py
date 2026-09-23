@@ -19,9 +19,10 @@ def main() -> None:
     logger.info("BeerTracker service starting...")
     logger.info("Log level: %s", settings.log_level)
     logger.info(
-        "Sync active/hibernate: %ds / %ds",
+        "Sync: %ds active / %ds hibernate (after %d min idle)",
         settings.sync_interval_active,
         settings.sync_interval_hibernate,
+        settings.sync_hibernate_after_minutes,
     )
     logger.info("Token refresh: %s minutes", settings.token_refresh_minutes)
 

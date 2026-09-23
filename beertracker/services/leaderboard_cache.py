@@ -2,7 +2,6 @@
 
 import logging
 import threading
-from datetime import datetime, timezone
 from typing import Any
 
 from beertracker.core.leaderboard import compute_leaderboard
@@ -12,8 +11,6 @@ logger = logging.getLogger(__name__)
 
 COLLECTION_CARDS = "cards"
 COLLECTION_USERS = "users"
-COLLECTION_LEADERBOARD = "leaderboard"
-DOC_TOP100 = "top100"
 
 
 class LeaderboardCache:
@@ -37,8 +34,6 @@ class LeaderboardCache:
         self._cards_watch = None
         self._users_watch = None
         self._started = False
-
-        self._last_activity_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -81,18 +76,6 @@ class LeaderboardCache:
         logger.info("LeaderboardCache: listeners stopped")
 
     # ------------------------------------------------------------------
-    # Accessors
-    # ------------------------------------------------------------------
-
-    def has_activity(self, since_minutes: int) -> bool:
-        """Return True if any card was updated within ``since_minutes``."""
-        with self._lock:
-            if self._last_activity_at is None:
-                return False
-            delta = (datetime.now(timezone.utc) - self._last_activity_at).total_seconds()
-            return delta < (since_minutes * 60)
-
-    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -107,11 +90,9 @@ class LeaderboardCache:
                 data = doc.to_dict() or {}
                 self._users[doc.id] = _user_from_doc(doc.id, data)
 
-            # Treat startup as activity so we don't immediately hibernate
-            self._last_activity_at = datetime.now(timezone.utc)
             self._recompute_and_write()
 
-    def _on_cards_changed(self, col_snapshot, _changes, _read_time) -> None:
+    def _on_cards_changed(self, _col_snapshot, _changes, _read_time) -> None:
         """Firestore ``on_snapshot`` callback for cards collection."""
         updated = False
         with self._lock:
@@ -125,16 +106,14 @@ class LeaderboardCache:
                     data = doc.to_dict() or {}
                     old_card = self._cards.get(card_id)
                     new_card = _card_from_doc(card_id, data)
-                    # Only treat a real change as activity (avoids noise)
                     if old_card is None or not _cards_equal(old_card, new_card):
                         self._cards[card_id] = new_card
                         updated = True
 
             if updated:
-                self._last_activity_at = datetime.now(timezone.utc)
                 self._recompute_and_write()
 
-    def _on_users_changed(self, col_snapshot, _changes, _read_time) -> None:
+    def _on_users_changed(self, _col_snapshot, _changes, _read_time) -> None:
         """Firestore ``on_snapshot`` callback for users collection."""
         updated = False
         with self._lock:

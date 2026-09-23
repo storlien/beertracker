@@ -4,6 +4,7 @@ import logging
 import signal
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -45,6 +46,7 @@ class SyncWorker:
         self._sync_lock = threading.Lock()
 
         self._current_interval: int | None = None
+        self._last_purchase_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Jobs
@@ -60,6 +62,9 @@ class SyncWorker:
 
         This job is protected by a lock so overlapping invocations (initial
         sync + interval) are skipped rather than running concurrently.
+
+        If any purchases are synced, ``_last_purchase_at`` is updated so the
+        adaptive check knows the bar is active.
         """
         if not self._sync_lock.acquire(blocking=False):
             logger.info("Sync already in progress — skipping overlapping job")
@@ -122,6 +127,15 @@ class SyncWorker:
                 current_hash or "", total_purchases_synced=0
             )
 
+            # Only real Zettle purchases count as bar activity.
+            if total_purchases > 0:
+                self._last_purchase_at = datetime.now(timezone.utc)
+                logger.info(
+                    "Bar activity recorded: %d purchase(s) at %s",
+                    total_purchases,
+                    self._last_purchase_at.isoformat(),
+                )
+
             logger.info(
                 "Sync complete: %d purchases, %d unique cards updated across %d page(s)",
                 total_purchases,
@@ -143,9 +157,22 @@ class SyncWorker:
             logger.exception("Token refresh job failed")
 
     def _job_adaptive_check(self) -> None:
-        """Adjust sync interval based on recent bar activity."""
+        """Adjust sync interval based on recent bar activity.
+
+        Activity is defined as: a sync job found at least one new Zettle
+        purchase. Firestore listener changes (user edits, leaderboard writes,
+        etc.) do NOT count as activity.
+
+        On startup, the service is always in hibernate until the first
+        purchase arrives.
+        """
         settings = get_settings()
-        active = self._cache.has_activity(settings.sync_hibernate_after_minutes)
+
+        if self._last_purchase_at is None:
+            active = False
+        else:
+            delta_seconds = (datetime.now(timezone.utc) - self._last_purchase_at).total_seconds()
+            active = delta_seconds < (settings.sync_hibernate_after_minutes * 60)
 
         desired = (
             settings.sync_interval_active
@@ -185,9 +212,10 @@ class SyncWorker:
         # Start leaderboard cache (attaches Firestore listeners)
         self._cache.start()
 
-        # Determine initial interval based on activity
-        initial_interval = settings.sync_interval_active
+        # Always start in hibernate — only real Zettle purchases flip to active
+        initial_interval = settings.sync_interval_hibernate
         self._current_interval = initial_interval
+        self._last_purchase_at = None
 
         # Schedule jobs
         self._scheduler.add_job(
@@ -221,7 +249,7 @@ class SyncWorker:
 
         self._scheduler.start()
         logger.info(
-            "Scheduler started (sync every %ds, token refresh every %dm, "
+            "Scheduler started (hibernate %ds, token refresh every %dm, "
             "adaptive check every 60s)",
             initial_interval,
             settings.token_refresh_minutes,
