@@ -18,7 +18,7 @@ Python background service that syncs Zettle card purchase transactions to Fireba
 | Collection | Document ID | Fields |
 |---|---|---|
 | `cards` | `1234567890` (first 6 + last 4) | `sum` (float), `linkedUserId` (optional), `createdAt`, `updatedAt` |
-| `info` | `state` | `lastPurchaseHash` (string), `lastSyncAt` (timestamp), `totalPurchasesSynced` (int) |
+| `info` | `state` | `lastPurchaseHash` (string), `lastSyncAt` (timestamp), `totalPagesSynced` (int) |
 | `users` | auto-ID | Managed by website (not touched by this service) |
 | `leaderboard` | `top100` | `entries[]` (pre-computed top 100), `updatedAt` |
 

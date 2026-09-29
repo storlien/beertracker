@@ -12,9 +12,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from beertracker.api.client import ZettleClient
 from beertracker.api.token_manager import TokenManager
 from beertracker.config import get_settings
-from beertracker.core.mappers import aggregate_by_card, parse_purchases
+from beertracker.core.mappers import aggregate_by_card, aggregate_by_card_and_day, parse_purchases
 from beertracker.firebase.client import get_firestore_client
-from beertracker.firebase.repositories import CardRepository, StateRepository
+from beertracker.firebase.repositories import CardRepository, DailyUsageRepository, StateRepository
+from beertracker.services.daily_leaderboard_cache import DailyLeaderboardCache
 from beertracker.services.leaderboard_cache import LeaderboardCache
 from beertracker.services.leaderboard_repo import LeaderboardRepository
 
@@ -28,8 +29,8 @@ class SyncWorker:
     """Background worker that periodically syncs Zettle purchases to Firestore.
 
     Uses adaptive sync rate: active (fast) when bar is busy, hibernating (slow)
-    when idle. The leaderboard is kept in memory and updated via Firestore
-    listeners, so the frontend only reads a single ``leaderboard/top100`` doc.
+    when idle. Both the lifetime and daily leaderboards are kept in memory and
+    updated via Firestore listeners, so the frontend only reads pre-computed docs.
     """
 
     def __init__(self) -> None:
@@ -37,9 +38,11 @@ class SyncWorker:
         self._zettle = ZettleClient(self._token_manager)
         self._db = get_firestore_client()
         self._card_repo = CardRepository(self._db)
+        self._daily_usage_repo = DailyUsageRepository(self._db)
         self._state_repo = StateRepository(self._db)
         self._leaderboard_repo = LeaderboardRepository(self._db)
         self._cache = LeaderboardCache(self._db, self._leaderboard_repo)
+        self._daily_cache = DailyLeaderboardCache(self._db, self._leaderboard_repo)
 
         self._scheduler = BackgroundScheduler()
         self._shutdown_event = threading.Event()
@@ -92,11 +95,22 @@ class SyncWorker:
                 # Parse and filter to IZETTLE_CARD only for this page
                 purchases = parse_purchases({"purchases": raw_purchases})
                 if purchases:
+                    # Lifetime totals (existing)
                     card_totals = aggregate_by_card(purchases)
                     self._card_repo.batch_increment_sums(
                         card_totals,
                         page_last_purchase_hash=current_hash or "",
                     )
+
+                    # Daily totals (new)
+                    daily_totals = aggregate_by_card_and_day(purchases)
+                    for bar_day, day_cards in daily_totals.items():
+                        self._daily_usage_repo.merge_daily_card_totals(
+                            bar_day=bar_day,
+                            card_totals=day_cards,
+                            page_last_purchase_hash=current_hash or "",
+                        )
+
                     total_cards_updated.update(card_totals.keys())
                     total_purchases += len(purchases)
 
@@ -124,7 +138,7 @@ class SyncWorker:
             # Update lastSyncAt even when idle to show the service is alive.
             # Without this, healthcheck fails after 10 minutes of no bar sales.
             self._state_repo.update_sync_state(
-                current_hash or "", total_purchases_synced=0
+                current_hash or "", pages_synced=0
             )
 
             # Only real Zettle purchases count as bar activity.
@@ -209,8 +223,9 @@ class SyncWorker:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self._signal_handler)
 
-        # Start leaderboard cache (attaches Firestore listeners)
+        # Start leaderboard caches (attaches Firestore listeners)
         self._cache.start()
+        self._daily_cache.start()
 
         # Always start in hibernate — only real Zettle purchases flip to active
         initial_interval = settings.sync_interval_hibernate
@@ -274,6 +289,7 @@ class SyncWorker:
         self._scheduler.shutdown(wait=True)
         self._zettle.close()
         self._cache.stop()
+        self._daily_cache.stop()
         logger.info("SyncWorker shutdown complete")
 
     def _signal_handler(self, signum: int, _frame: Any) -> None:

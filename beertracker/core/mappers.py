@@ -6,11 +6,20 @@ from datetime import datetime
 from typing import Any
 
 from beertracker.core.models import Purchase
+from beertracker.core.date_utils import purchase_to_bar_day
 
 logger = logging.getLogger(__name__)
 
 #: Payment type to include (card purchases only, not Vipps).
 CARD_PAYMENT_TYPE = "IZETTLE_CARD"
+
+
+class ParseFailed(Exception):
+    """Raised when a purchase cannot be parsed."""
+
+    def __init__(self, raw: Any) -> None:
+        self.raw = raw
+        super().__init__(f"Failed to parse purchase: {raw}")
 
 
 def parse_purchases(json_data: dict[str, Any]) -> list[Purchase]:
@@ -104,3 +113,27 @@ def aggregate_by_card(purchases: list[Purchase]) -> dict[str, float]:
     for p in purchases:
         totals[p.card_number] += p.amount
     return dict(totals)
+
+
+def aggregate_by_card_and_day(purchases: list[Purchase]) -> dict[str, dict[str, float]]:
+    """Aggregate purchase amounts grouped by bar-day and card number.
+
+    Args:
+        purchases: List of Purchase objects. Each must have a non-None
+            ``timestamp`` so that the bar-day can be determined.
+
+    Returns:
+        Mapping from bar-day (``YYYY-MM-DD``) -> card_number -> total amount.
+    .
+    """
+    totals: defaultdict[str, defaultdict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for p in purchases:
+        if p.timestamp is None:
+            logger.warning(
+                "Skipping purchase %s — no timestamp for bar-day grouping", p.purchase_hash
+            )
+            continue
+        bar_day = purchase_to_bar_day(p.timestamp)
+        totals[bar_day][p.card_number] += p.amount
+
+    return {day: dict(cards) for day, cards in totals.items()}

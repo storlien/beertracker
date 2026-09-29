@@ -12,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 COLLECTION_CARDS = "cards"
 COLLECTION_INFO = "info"
+COLLECTION_DAILY_USAGE = "dailyUsage"
 DOC_STATE = "state"
 FIELD_LAST_PURCHASE_HASH = "lastPurchaseHash"
 FIELD_LAST_SYNC_AT = "lastSyncAt"
-FIELD_TOTAL_PURCHASES = "totalPurchasesSynced"
+FIELD_TOTAL_PAGES = "totalPagesSynced"
 
 
 def _increment_card_transaction(transaction, doc_ref, amount: float, page_hash: str) -> bool:
@@ -45,6 +46,7 @@ def _increment_card_transaction(transaction, doc_ref, amount: float, page_hash: 
             "sum": round(new_sum, 2),
             FIELD_LAST_PURCHASE_HASH: page_hash,
             "updatedAt": now,
+            "createdAt": now if not snapshot.exists else snapshot.to_dict().get("createdAt", now),
         },
         merge=True,
     )
@@ -175,6 +177,84 @@ class CardRepository:
             )
 
 
+class DailyUsageRepository:
+    """Repository for per-bar-day card spending in Firestore.
+
+    Each document at ``dailyUsage/{bar-day}`` tracks how much each card
+    spent on that bar day. Page hashes are stored to make repeated processing
+    idempotent.
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+        self._col = db.collection(COLLECTION_DAILY_USAGE)
+
+    def merge_daily_card_totals(
+        self,
+        bar_day: str,
+        card_totals: dict[str, float],
+        page_last_purchase_hash: str,
+    ) -> bool:
+        """Merge card totals into a bar-day doc, idempotent by page hash.
+
+        Uses an atomic transaction to read the existing document, check
+        the processed page hashes, and skip if already processed.
+
+        Args:
+            bar_day: Bar-day string (``YYYY-MM-DD``).
+            card_totals: Mapping from card_number -> amount for this day.
+            page_last_purchase_hash: The Zettle page hash for this batch.
+
+        Returns:
+            ``True`` if merged, ``False`` if the page was already recorded.
+        """
+        doc_ref = self._col.document(bar_day)
+
+        @self._db.transaction
+        def _txn(transaction):
+            snapshot = doc_ref.get(transaction=transaction)
+            processed = set()
+            if snapshot.exists:
+                raw = snapshot.to_dict().get("processedPageHashes", [])
+                if isinstance(raw, list):
+                    processed = set(raw)
+
+            if page_last_purchase_hash in processed:
+                return False
+
+            # Build merge payload
+            update: dict[str, Any] = {"processedPageHashes": _firestore_mod.ArrayUnion([page_last_purchase_hash])}
+            for card, amount in card_totals.items():
+                field = f"cards.{card}"
+                if snapshot.exists:
+                    current = (snapshot.to_dict().get("cards") or {}).get(card, 0.0)
+                    update[field] = round(current + amount, 2)
+                else:
+                    update[field] = round(amount, 2)
+
+            transaction.set(doc_ref, update, merge=True)
+            return True
+
+        merged = _txn(self._db.transaction())
+        if merged:
+            logger.info(
+                "Merged %d cards into dailyUsage/%s (hash=%s)",
+                len(card_totals),
+                bar_day,
+                page_last_purchase_hash,
+            )
+        return merged
+
+    def get(self, bar_day: str) -> dict[str, Any] | None:
+        """Return the raw dailyUsage document for a bar day, or None."""
+        doc = self._col.document(bar_day).get()
+        return doc.to_dict() if doc.exists else None
+
+    def get_bar_days(self) -> list[str]:
+        """Return all stored bar-day document IDs, sorted ascending."""
+        return sorted(d.id for d in self._col.stream())
+
+
 class StateRepository:
     """Repository for global sync state in Firestore."""
 
@@ -204,16 +284,16 @@ class StateRepository:
     def update_sync_state(
         self,
         last_purchase_hash: str,
-        total_purchases_synced: int | None = None,
+        pages_synced: int | None = None,
     ) -> None:
         """Update all sync state fields atomically."""
         update_data: dict[str, Any] = {
             FIELD_LAST_PURCHASE_HASH: last_purchase_hash,
             FIELD_LAST_SYNC_AT: datetime.now(timezone.utc),
-            FIELD_TOTAL_PURCHASES: _firestore_mod.Increment(1),
+            FIELD_TOTAL_PAGES: _firestore_mod.Increment(1),
         }
-        if total_purchases_synced is not None:
-            update_data[FIELD_TOTAL_PURCHASES] = _firestore_mod.Increment(total_purchases_synced)
+        if pages_synced is not None:
+            update_data[FIELD_TOTAL_PAGES] = _firestore_mod.Increment(pages_synced)
         self._doc_ref.update(update_data)
         logger.info("Sync state updated: hash=%s", last_purchase_hash)
 
