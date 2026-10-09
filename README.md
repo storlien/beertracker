@@ -22,10 +22,7 @@ Python background service that syncs Zettle card purchase transactions to Fireba
 | `users` | auto-ID | Managed by website (not touched by this service) |
 | `leaderboard` | `top100` | `entries[]` (pre-computed top 100), `updatedAt` |
 
-> **Firestore Rules**: Update your rules to allow read access on the `leaderboard` collection:
-> ```
-> match /leaderboard/top100 { allow read: if true; }
-> ```
+> **Firestore Rules**: Remember to update your rules to allow read access on necessary collections
 
 ## Adaptive Sync Rate
 
@@ -77,8 +74,6 @@ chmod 600 .env        # restrict permissions — contains secrets
 | `BEERTRACKER_SYNC_HIBERNATE_AFTER_MINUTES` | | `60` | Minutes of no activity before hibernation |
 | `BEERTRACKER_TOKEN_REFRESH_MINUTES` | | `30` | Minutes between token refreshes |
 | `BEERTRACKER_LOG_LEVEL` | | `INFO` | Logging level |
-
-**⚠️ Security**: `.env` and `firebase-service-account.json` are both in `.gitignore` and `.dockerignore`. Never commit them.
 
 ## Running Locally
 
@@ -153,12 +148,5 @@ pyproject.toml            # uv project config
 | `Service.java` timer logic | `scheduler.py` | APScheduler with adaptive sync + cache |
 
 ---
-
-## Security
-
-- `firebase-service-account.json` is in `.gitignore` and `.dockerignore` — **never commit it**
-- All secrets are injected via environment variables
-- The container runs as non-root (`appuser`)
-- No secrets are logged by the structured logger
 
 ### Refactoring and further development done with OpenCode and Kimi K2.6
