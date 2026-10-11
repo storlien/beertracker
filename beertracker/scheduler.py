@@ -69,13 +69,15 @@ class SyncWorker:
         If any purchases are synced, ``_last_purchase_at`` is updated so the
         adaptive check knows the bar is active.
         """
+        from beertracker.core.date_utils import oslo_now_str
+
         if not self._sync_lock.acquire(blocking=False):
-            logger.info("Sync already in progress — skipping overlapping job")
+            logger.info("Sync in progress → skipped (%s)", oslo_now_str())
             return
 
         try:
             current_hash = self._state_repo.get_last_purchase_hash()
-            logger.info("Starting incremental sync. lastPurchaseHash=%s", current_hash)
+            logger.info("Sync starting (%s)", oslo_now_str())
 
             total_purchases = 0
             total_cards_updated: set[str] = set()
@@ -145,30 +147,33 @@ class SyncWorker:
             if total_purchases > 0:
                 self._last_purchase_at = datetime.now(timezone.utc)
                 logger.info(
-                    "Bar activity recorded: %d purchase(s) at %s",
+                    "Bar activity recorded: %d purchase(s) (%s)",
                     total_purchases,
-                    self._last_purchase_at.isoformat(),
+                    oslo_now_str(),
                 )
 
             logger.info(
-                "Sync complete: %d purchases, %d unique cards updated across %d page(s)",
+                "Sync done: %d purchases, %d cards, %d page(s) (%s)",
                 total_purchases,
                 len(total_cards_updated),
                 page_count - 1,
+                oslo_now_str(),
             )
 
         except Exception:
-            logger.exception("Purchase sync job failed")
+            logger.exception("Sync failed (%s)", oslo_now_str())
         finally:
             self._sync_lock.release()
 
     def _job_refresh_token(self) -> None:
         """Refresh the Zettle OAuth token."""
+        from beertracker.core.date_utils import oslo_now_str
+
         try:
             self._token_manager.refresh()
-            logger.info("Token refreshed successfully")
+            logger.info("Token refreshed OK (%s)", oslo_now_str())
         except Exception:
-            logger.exception("Token refresh job failed")
+            logger.exception("Token refresh failed (%s)", oslo_now_str())
 
     def _job_adaptive_check(self) -> None:
         """Adjust sync interval based on recent bar activity.
@@ -180,6 +185,8 @@ class SyncWorker:
         On startup, the service is always in hibernate until the first
         purchase arrives.
         """
+        from beertracker.core.date_utils import oslo_now_str
+
         settings = get_settings()
 
         if self._last_purchase_at is None:
@@ -197,9 +204,10 @@ class SyncWorker:
         if self._current_interval != desired:
             self._current_interval = desired
             logger.info(
-                "Adaptive sync: %s mode → %ds interval",
+                "Adaptive sync: %s → %ds (%s)",
                 "ACTIVE" if active else "HIBERNATE",
                 desired,
+                oslo_now_str(),
             )
             try:
                 self._scheduler.reschedule_job(
@@ -208,7 +216,7 @@ class SyncWorker:
                     seconds=desired,
                 )
             except Exception:
-                logger.exception("Failed to reschedule sync job")
+                logger.exception("Reschedule failed (%s)", oslo_now_str())
 
     # ------------------------------------------------------------------
     # Lifecycle

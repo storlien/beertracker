@@ -40,3 +40,8 @@ def current_bar_day() -> str:
     if now.hour < BAR_DAY_CUTOFF_HOUR:
         now = now - timedelta(days=1)
     return now.strftime("%Y-%m-%d")
+
+
+def oslo_now_str(fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Return the current moment formatted in Oslo timezone."""
+    return datetime.now(OSLO_TZ).strftime(fmt)

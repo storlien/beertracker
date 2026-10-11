@@ -35,3 +35,6 @@ def configure_logging() -> None:
         stream=sys.stdout,
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
     )
+
+    # Suppress verbose APScheduler internal job-start / job-end messages
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
