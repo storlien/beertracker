@@ -11,8 +11,9 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Copy dependency manifests
+# Copy dependency manifests + source so uv can build the package wheel
 COPY pyproject.toml uv.lock /app/
+COPY beertracker /app/beertracker
 
 # Install production dependencies into a virtual environment
 RUN uv sync --no-dev --no-editable --frozen

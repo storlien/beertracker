@@ -29,3 +29,14 @@ def purchase_to_bar_day(ts: datetime) -> str:
         oslo_time = oslo_time - timedelta(days=1)
 
     return oslo_time.strftime("%Y-%m-%d")
+
+
+def current_bar_day() -> str:
+    """Return the bar-day string for the current moment in Oslo time.
+
+    A bar day runs from 05:00 to 05:00 the next calendar day.
+    """
+    now = datetime.now(OSLO_TZ).replace(tzinfo=None)
+    if now.hour < BAR_DAY_CUTOFF_HOUR:
+        now = now - timedelta(days=1)
+    return now.strftime("%Y-%m-%d")

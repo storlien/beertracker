@@ -195,6 +195,86 @@ def _parse_java_map(content: str) -> dict[str, list[float]]:
     return result
 
 
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Show what would be changed without writing")
+def migrate_daily_usage(dry_run: bool) -> None:
+    """Migrate dailyUsage docs from flat cards.XXX fields to nested cards map.
+
+    Reads the full document, merges any existing nested ``cards`` map with
+    values extracted from flat ``cards.XXX`` top-level fields, removes the
+    flat fields, and overwrites the document cleanly.
+    """
+    from beertracker.firebase.client import get_firestore_client
+
+    db = get_firestore_client()
+    col = db.collection("dailyUsage")
+
+    click.echo("Fetching dailyUsage documents...")
+    docs = list(col.stream())
+    click.echo(f"Found {len(docs)} documents in dailyUsage")
+
+    migrated = 0
+    skipped = 0
+    for doc in docs:
+        data: dict = doc.to_dict() or {}
+
+        # Build the clean nested cards dict from whatever sources exist
+        clean_cards: dict[str, float] = {}
+        has_flat = False
+
+        # 1) Existing nested map (may be empty because of a bad previous run)
+        raw_cards = data.get("cards")
+        if isinstance(raw_cards, dict):
+            clean_cards = {str(k): float(v) for k, v in raw_cards.items()}
+
+        # 2) Flat top-level fields like "cards.4056023365"
+        keys_to_remove: list[str] = []
+        for k, v in data.items():
+            if k.startswith("cards."):
+                card_id = k.replace("cards.", "")
+                clean_cards[card_id] = float(v)
+                keys_to_remove.append(k)
+                has_flat = True
+
+        # Nothing to fix?  (has real nested map and no flat fields)
+        if clean_cards and not has_flat and isinstance(raw_cards, dict):
+            skipped += 1
+            click.echo(f"  SKIP {doc.id}: already clean ({len(clean_cards)} cards)")
+            continue
+
+        # Nothing at all to migrate
+        if not clean_cards:
+            skipped += 1
+            click.echo(f"  SKIP {doc.id}: no card data found")
+            continue
+
+        # Build the cleaned document payload
+        new_data = dict(data)
+        for k in keys_to_remove:
+            new_data.pop(k, None)
+        new_data["cards"] = clean_cards
+
+        if dry_run:
+            click.echo(
+                f"[DRY] {doc.id}: would write {len(clean_cards)} cards into "
+                f"nested 'cards' map and remove {len(keys_to_remove)} flat fields"
+            )
+        else:
+            doc.reference.set(new_data)
+            click.echo(
+                f"  DONE {doc.id}: wrote {len(clean_cards)} cards, "
+                f"removed {len(keys_to_remove)} flat fields"
+            )
+        migrated += 1
+
+    action = "Would migrate" if dry_run else "Migrated"
+    click.echo(f"{action} {migrated} documents, skipped {skipped} already-clean documents.")
+
+
 def main() -> None:
     """Entry point for the CLI."""
     cli()
+
+
+if __name__ == "__main__":
+    main()

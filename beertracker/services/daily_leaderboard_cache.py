@@ -133,12 +133,28 @@ class DailyLeaderboardCache:
                 self._recompute_and_write()
 
     def _recompute_and_write(self) -> None:
-        """Recompute the daily leaderboard for the active day and write to Firestore."""
+        """Recompute the daily leaderboard for the active / most recent bar day.
+
+        Prefer the *current* bar day (determined from wall-clock time in Oslo).
+        If the current bar day has no recorded usage yet, fall back to the
+        most recent stored bar day.
+        """
         if not self._daily_usage:
             logger.debug("No daily usage data — skipping daily leaderboard recomputation")
             return
 
-        active_day = max(self._daily_usage.keys())
+        from beertracker.core.date_utils import current_bar_day
+
+        current_day = current_bar_day()
+        sorted_days = sorted(self._daily_usage.keys())
+        latest_day = sorted_days[-1]
+
+        if current_day in self._daily_usage:
+            active_day = current_day
+        else:
+            # Bar is not open yet today — show last finished day
+            active_day = latest_day
+
         daily_cards = self._daily_usage[active_day]
 
         entries = compute_daily_leaderboard(daily_cards, self._users)

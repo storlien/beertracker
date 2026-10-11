@@ -210,8 +210,8 @@ class DailyUsageRepository:
         """
         doc_ref = self._col.document(bar_day)
 
-        @self._db.transaction
-        def _txn(transaction):
+        @_firestore_mod.transactional
+        def _txn(transaction, doc_ref, card_totals, page_last_purchase_hash):
             snapshot = doc_ref.get(transaction=transaction)
             processed = set()
             if snapshot.exists:
@@ -222,20 +222,29 @@ class DailyUsageRepository:
             if page_last_purchase_hash in processed:
                 return False
 
-            # Build merge payload
-            update: dict[str, Any] = {"processedPageHashes": _firestore_mod.ArrayUnion([page_last_purchase_hash])}
+            # Build merge payload with nested cards map
+            existing_cards: dict[str, float] = {}
+            if snapshot.exists:
+                raw_cards = snapshot.to_dict().get("cards")
+                if isinstance(raw_cards, dict):
+                    existing_cards = {
+                        str(k): float(v) for k, v in raw_cards.items()
+                    }
+
+            update_cards: dict[str, float] = {}
             for card, amount in card_totals.items():
-                field = f"cards.{card}"
-                if snapshot.exists:
-                    current = (snapshot.to_dict().get("cards") or {}).get(card, 0.0)
-                    update[field] = round(current + amount, 2)
-                else:
-                    update[field] = round(amount, 2)
+                current = existing_cards.get(card, 0.0)
+                update_cards[card] = round(current + amount, 2)
+
+            update: dict[str, Any] = {
+                "processedPageHashes": _firestore_mod.ArrayUnion([page_last_purchase_hash]),
+                "cards": update_cards,
+            }
 
             transaction.set(doc_ref, update, merge=True)
             return True
 
-        merged = _txn(self._db.transaction())
+        merged = _txn(self._db.transaction(), doc_ref, card_totals, page_last_purchase_hash)
         if merged:
             logger.info(
                 "Merged %d cards into dailyUsage/%s (hash=%s)",
