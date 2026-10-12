@@ -304,22 +304,48 @@ def card_history(card_number: str, days: int) -> None:
         f"for card {card_number}...\n"
     )
 
+    cutoff = datetime.combine(start_date, datetime.min.time()).replace(
+        tzinfo=OSLO_TZ
+    )
+
     raw_list: list[dict] = []
     current_hash: str | None = None
+    page_count = 0
     while True:
+        page_count += 1
         data = client.get_purchases(
-            start_date=start_date.isoformat() if current_hash is None else None,
             last_purchase_hash=current_hash,
+            descending=True,
             limit=1000,
         )
         purchases = data.get("purchases", [])
         if not purchases:
             break
+
         raw_list.extend(purchases)
+
+        # Check if the oldest item on this page is already before the cutoff.
+        # Since descending=true returns newest-first, the last item in the
+        # list is the oldest. If that is before cutoff we can stop after
+        # filtering later, but we still need to keep paging in case some
+        # items on earlier pages straddle the boundary.
+        last_item_raw = purchases[-1].get("timestamp", "")
+        try:
+            last_ts = datetime.fromisoformat(last_item_raw.replace("Z", "+00:00"))
+            last_oslo = last_ts.astimezone(OSLO_TZ)
+        except (ValueError, TypeError):
+            last_oslo = None
+
+        if last_oslo and last_oslo < cutoff:
+            # Oldest on this page is before cutoff — stop paging
+            break
+
         next_hash = data.get("lastPurchaseHash")
         if not next_hash or next_hash == current_hash:
             break
         current_hash = next_hash
+
+    click.echo(f"Fetched {len(raw_list)} raw Zettle rows across {page_count} page(s).")
 
     # Filter and parse records for the requested card
     rows = []
@@ -342,6 +368,10 @@ def card_history(card_number: str, days: int) -> None:
             ts_utc = datetime.fromisoformat(ts_iso)
             ts_oslo = ts_utc.astimezone(OSLO_TZ)
         except (ValueError, TypeError):
+            continue
+
+        # Drop items that are actually before the cutoff (last page boundary)
+        if ts_oslo < cutoff:
             continue
 
         bar_day = purchase_to_bar_day(ts_oslo)
