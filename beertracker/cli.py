@@ -2,6 +2,7 @@
 
 import ast
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -269,6 +270,107 @@ def migrate_daily_usage(dry_run: bool) -> None:
 
     action = "Would migrate" if dry_run else "Migrated"
     click.echo(f"{action} {migrated} documents, skipped {skipped} already-clean documents.")
+
+
+@cli.command()
+@click.argument("card_number")
+@click.option("--days", default=7, help="Number of days back from today")
+def card_history(card_number: str, days: int) -> None:
+    """Fetch Zettle purchase history for a single card and print a table.
+
+    Queries the Zettle API directly — no Firestore reads.  Dates and times
+    are shown in Oslo timezone.  CARD_NUMBER must be a 10-digit card.
+    """
+    from datetime import date, timedelta
+
+    from beertracker.api.client import ZettleClient
+    from beertracker.api.token_manager import TokenManager
+    from beertracker.core.date_utils import OSLO_TZ, purchase_to_bar_day
+    from beertracker.core.mappers import CARD_PAYMENT_TYPE
+
+    if len(card_number) != 10:
+        raise click.BadParameter("Card number must be exactly 10 digits")
+
+    # Compute inclusive date range (today minus N days, back to today)
+    today = date.today()
+    start_date = today - timedelta(days=days)
+
+    tm = TokenManager()
+    tm.refresh()
+    client = ZettleClient(tm)
+
+    click.echo(
+        f"Fetching last {days} days ({start_date} → {today}) "
+        f"for card {card_number}...\n"
+    )
+
+    raw_list: list[dict] = []
+    current_hash: str | None = None
+    while True:
+        data = client.get_purchases(
+            start_date=start_date.isoformat() if current_hash is None else None,
+            last_purchase_hash=current_hash,
+            limit=1000,
+        )
+        purchases = data.get("purchases", [])
+        if not purchases:
+            break
+        raw_list.extend(purchases)
+        next_hash = data.get("lastPurchaseHash")
+        if not next_hash or next_hash == current_hash:
+            break
+        current_hash = next_hash
+
+    # Filter and parse records for the requested card
+    rows = []
+    total = 0.0
+    for raw in raw_list:
+        payments = raw.get("payments", [])
+        if not payments:
+            continue
+        payment = payments[0]
+        if payment.get("type") != CARD_PAYMENT_TYPE:
+            continue
+        masked = payment.get("attributes", {}).get("maskedPan", "")
+        if masked.replace("*", "") != card_number:
+            continue
+
+        amount = float(raw.get("amount", 0)) / 100.0
+        ts_raw = raw.get("timestamp", "")
+        ts_iso = ts_raw.replace("Z", "+00:00")
+        try:
+            ts_utc = datetime.fromisoformat(ts_iso)
+            ts_oslo = ts_utc.astimezone(OSLO_TZ)
+        except (ValueError, TypeError):
+            continue
+
+        bar_day = purchase_to_bar_day(ts_oslo)
+        rows.append(
+            {
+                "bar_day": bar_day,
+                "date": ts_oslo.strftime("%Y-%m-%d"),
+                "time": ts_oslo.strftime("%H:%M"),
+                "amount": round(amount, 2),
+                "ts": ts_oslo,
+            }
+        )
+        total += amount
+
+    # Sort newest first
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+
+    if not rows:
+        click.echo("No purchases found for this card in the requested period.")
+        return
+
+    click.echo(f"{'Bar-day':<12} {'Date':<12} {'Time':<8} {'Amount (kr)':>12}")
+    click.echo("-" * 46)
+    for r in rows:
+        click.echo(
+            f"{r['bar_day']:<12} {r['date']:<12} {r['time']:<8} {r['amount']:>12.2f}"
+        )
+    click.echo("-" * 46)
+    click.echo(f"{'Summary:':<33} {total:>12.2f} kr  ({len(rows)} transaction(s))")
 
 
 def main() -> None:
