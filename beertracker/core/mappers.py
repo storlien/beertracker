@@ -96,7 +96,7 @@ def parse_purchases(json_data: dict[str, Any]) -> list[Purchase]:
             logger.exception("Failed to parse purchase item: %s", raw)
             continue
 
-    logger.info("Parsed %d card purchases from %d raw items", len(purchases), len(raw_purchases))
+    logger.info("Parsed %d card purchases from %d raw transactions", len(purchases), len(raw_purchases))
     return purchases
 
 
