@@ -403,6 +403,347 @@ def card_history(card_number: str, days: int) -> None:
     click.echo(f"{'Summary:':<33} {total:>12.2f} kr  ({len(rows)} transaction(s))")
 
 
+@cli.command()
+@click.option("--days", default=7, help="Days back from today to aggregate")
+@click.option("--dry-run", is_flag=True, help="Preview without writing")
+def seed_test_cards(days: int, dry_run: bool) -> None:
+    """Fetch Zettle purchases for the last N days and write to a ``cards_test*``
+    collection with per-card lifetime sums and per-bar-day breakdowns.
+
+    The collection name is auto-incremented (``cards_test1``, ``cards_test2``, …)
+    to avoid overwriting existing test data.
+    """
+    import re
+    from datetime import date, timedelta, timezone
+
+    from beertracker.api.client import ZettleClient
+    from beertracker.api.token_manager import TokenManager
+    from beertracker.core.date_utils import OSLO_TZ, purchase_to_bar_day
+    from beertracker.core.mappers import CARD_PAYMENT_TYPE
+    from beertracker.firebase.client import get_firestore_client
+
+    today = date.today()
+    start_date = today - timedelta(days=days)
+    cutoff = datetime.combine(start_date, datetime.min.time()).replace(
+        tzinfo=OSLO_TZ
+    )
+
+    tm = TokenManager()
+    tm.refresh()
+    client = ZettleClient(tm)
+
+    click.echo(f"Fetching last {days} days ({start_date} → {today}) from Zettle...")
+
+    # ── page backwards from today ──
+    raw_list: list[dict] = []
+    current_hash: str | None = None
+    page_count = 0
+    while True:
+        page_count += 1
+        data = client.get_purchases(
+            last_purchase_hash=current_hash,
+            descending=True,
+            limit=1000,
+        )
+        purchases = data.get("purchases", [])
+        if not purchases:
+            break
+        raw_list.extend(purchases)
+
+        last_item_raw = purchases[-1].get("timestamp", "")
+        try:
+            last_ts = datetime.fromisoformat(last_item_raw.replace("Z", "+00:00"))
+            last_oslo = last_ts.astimezone(OSLO_TZ)
+        except (ValueError, TypeError):
+            last_oslo = None
+
+        if last_oslo and last_oslo < cutoff:
+            break
+
+        next_hash = data.get("lastPurchaseHash")
+        if not next_hash or next_hash == current_hash:
+            break
+        current_hash = next_hash
+
+    click.echo(f"Fetched {len(raw_list)} raw rows across {page_count} page(s).")
+
+    # ── aggregate by card and by bar-day ──
+    card_sums: dict[str, float] = {}
+    card_days: dict[str, dict[str, float]] = {}
+
+    for raw in raw_list:
+        payments = raw.get("payments", [])
+        if not payments:
+            continue
+        payment = payments[0]
+        if payment.get("type") != CARD_PAYMENT_TYPE:
+            continue
+
+        masked = payment.get("attributes", {}).get("maskedPan", "")
+        card = masked.replace("*", "")
+        if len(card) != 10:
+            continue
+
+        amount = float(raw.get("amount", 0)) / 100.0
+        ts_raw = raw.get("timestamp", "")
+        ts_iso = ts_raw.replace("Z", "+00:00")
+        try:
+            ts_utc = datetime.fromisoformat(ts_iso)
+            ts_oslo = ts_utc.astimezone(OSLO_TZ)
+        except (ValueError, TypeError):
+            continue
+
+        if ts_oslo < cutoff:
+            continue
+
+        bar_day = purchase_to_bar_day(ts_oslo)
+
+        card_sums[card] = card_sums.get(card, 0.0) + amount
+        if card not in card_days:
+            card_days[card] = {}
+        card_days[card][bar_day] = card_days[card].get(bar_day, 0.0) + amount
+
+    if not card_sums:
+        click.echo("No card purchases found in the requested period.")
+        return
+
+    # ── pick next available collection name ──
+    db = get_firestore_client()
+    existing_names = [c.id for c in db.collections()]
+    prefix = "cards_test"
+    nums = []
+    for name in existing_names:
+        m = re.match(rf"{re.escape(prefix)}(\d+)", name)
+        if m:
+            nums.append(int(m.group(1)))
+    next_num = max(nums, default=0) + 1
+    col_name = f"{prefix}{next_num}"
+
+    click.echo(
+        f"\nWould write {len(card_sums)} cards to collection '{col_name}'."
+        if dry_run
+        else f"\nWriting {len(card_sums)} cards to '{col_name}'..."
+    )
+
+    now = datetime.now(timezone.utc)
+    col = db.collection(col_name)
+    for card, total in sorted(card_sums.items(), key=lambda x: x[1], reverse=True):
+        days_data = {d: round(v, 2) for d, v in sorted(card_days[card].items())}
+        payload = {
+            "sum": round(total, 2),
+            "days": days_data,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        if dry_run:
+            click.echo(f"  [DRY] {card}: {payload['sum']:.2f} kr ({len(days_data)} day(s))")
+        else:
+            col.document(card).set(payload)
+            click.echo(f"  {card}: {payload['sum']:.2f} kr")
+
+    click.echo(f"\nDone. Total: {sum(card_sums.values()):.2f} kr across {len(card_sums)} cards.")
+
+
+@cli.command()
+@click.argument("file_path", type=click.Path(exists=True, readable=True))
+@click.option("--dry-run", is_flag=True, help="Preview without writing")
+def seed_test_cards_from_file(file_path: str, dry_run: bool) -> None:
+    """Import card sums from a historical file and merge with Zettle data.
+
+    FILE_PATH must follow the pattern ``cards-*-til-DD-MM-YYYY.txt``
+    and contain a Java/Map.toString() mapping of card numbers to lists
+    of amounts. The date in the filename is treated as **inclusive**.
+
+    The script will:
+    1. Parse the file into per-card lifetime sums.
+    2. Pick the next ``cards_testN`` collection name.
+    3. Fetch Zettle API transactions **from the day after the file end date**
+       through today, aggregating per-card lifetime sums + per-bar-day
+       breakdowns.
+    4. Write merged results to Firestore: ``cards_testN/{card}`` with
+       ``sum`` (total kr), ``days`` (bar-day → amount), ``createdAt``,
+       and ``updatedAt``.
+    """
+    import re
+    from datetime import date, timedelta, timezone
+
+    from beertracker.api.client import ZettleClient
+    from beertracker.api.token_manager import TokenManager
+    from beertracker.core.date_utils import OSLO_TZ, purchase_to_bar_day
+    from beertracker.core.mappers import CARD_PAYMENT_TYPE
+    from beertracker.firebase.client import get_firestore_client
+
+    # ── Determine end date from filename ──
+    path_name = Path(file_path).name
+    m = re.search(r"til-(\d{2})-(\d{2})-(\d{4})", path_name)
+    if not m:
+        raise click.BadParameter(
+            f"Filename must contain 'til-DD-MM-YYYY' pattern: {path_name}"
+        )
+
+    day_str, month_str, year_str = m.groups()
+    file_end_date = date(int(year_str), int(month_str), int(day_str))
+    zettle_start = file_end_date + timedelta(days=1)
+    today = date.today()
+
+    click.echo(
+        f"File covers up to (inclusive): {file_end_date.strftime('%Y-%m-%d')}\n"
+        f"Zettle fetch will start from: {zettle_start.strftime('%Y-%m-%d')}\n"
+    )
+
+    # ── Parse file ──
+    path = Path(file_path)
+    content = path.read_text(encoding="utf-8").strip()
+
+    try:
+        data = ast.literal_eval(content)
+    except (ValueError, SyntaxError):
+        data = _parse_java_map(content)
+
+    if not isinstance(data, dict):
+        raise click.BadParameter(f"File does not contain a valid map ({type(data).__name__})")
+
+    file_sums: dict[str, float] = {}
+    for card_id, amounts in data.items():
+        card_str = str(card_id).strip()
+        try:
+            total = sum(float(a) for a in amounts) if isinstance(amounts, list) else float(amounts)
+        except (TypeError, ValueError):
+            total = 0.0
+        file_sums[card_str] = round(total, 2)
+
+    click.echo(f"Parsed {len(file_sums)} cards from file = {sum(file_sums.values()):.2f} kr")
+
+    # ── Fetch Zettle data ──
+    click.echo(f"\nFetching Zettle data ({zettle_start} → {today})...")
+
+    cutoff = datetime.combine(zettle_start, datetime.min.time()).replace(tzinfo=OSLO_TZ)
+    tm = TokenManager()
+    tm.refresh()
+    client = ZettleClient(tm)
+
+    raw_list: list[dict] = []
+    current_hash: str | None = None
+    page_count = 0
+    while True:
+        page_count += 1
+        data = client.get_purchases(
+            last_purchase_hash=current_hash,
+            descending=True,
+            limit=1000,
+        )
+        purchases = data.get("purchases", [])
+        if not purchases:
+            break
+        raw_list.extend(purchases)
+
+        last_item_raw = purchases[-1].get("timestamp", "")
+        try:
+            last_ts = datetime.fromisoformat(last_item_raw.replace("Z", "+00:00"))
+            last_oslo = last_ts.astimezone(OSLO_TZ)
+        except (ValueError, TypeError):
+            last_oslo = None
+
+        if last_oslo and last_oslo < cutoff:
+            break
+
+        next_hash = data.get("lastPurchaseHash")
+        if not next_hash or next_hash == current_hash:
+            break
+        current_hash = next_hash
+
+    click.echo(f"Fetched {len(raw_list)} Zettle rows across {page_count} page(s)")
+
+    # ── Aggregate Zettle by card + bar-day ──
+    zettle_sums: dict[str, float] = {}
+    zettle_days: dict[str, dict[str, float]] = {}
+
+    for raw in raw_list:
+        payments = raw.get("payments", [])
+        if not payments:
+            continue
+        payment = payments[0]
+        if payment.get("type") != CARD_PAYMENT_TYPE:
+            continue
+
+        masked = payment.get("attributes", {}).get("maskedPan", "")
+        card = masked.replace("*", "")
+        if len(card) != 10:
+            continue
+
+        amount = float(raw.get("amount", 0)) / 100.0
+        ts_raw = raw.get("timestamp", "")
+        try:
+            ts_utc = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts_oslo = ts_utc.astimezone(OSLO_TZ)
+        except (ValueError, TypeError):
+            continue
+
+        if ts_oslo < cutoff:
+            continue
+
+        bar_day = purchase_to_bar_day(ts_oslo)
+        zettle_sums[card] = zettle_sums.get(card, 0.0) + amount
+        if card not in zettle_days:
+            zettle_days[card] = {}
+        zettle_days[card][bar_day] = zettle_days[card].get(bar_day, 0.0) + amount
+
+    click.echo(
+        f"Zettle data: {len(zettle_sums)} cards, "
+        f"{sum(zettle_sums.values()):.2f} kr"
+    )
+
+    # ── Pick cards_testN ──
+    db = get_firestore_client()
+    existing_names = [c.id for c in db.collections()]
+    nums = []
+    for name in existing_names:
+        match = re.match(r"cards_test(\d+)", name)
+        if match:
+            nums.append(int(match.group(1)))
+    next_num = max(nums, default=0) + 1
+    col_name = f"cards_test{next_num}"
+
+    # ── Merge and write ──
+    all_cards = set(file_sums.keys()) | set(zettle_sums.keys())
+    click.echo(
+        f"\nWould write {len(all_cards)} cards to '{col_name}'."
+        if dry_run
+        else f"\nWriting {len(all_cards)} cards to '{col_name}'..."
+    )
+
+    now = datetime.now(timezone.utc)
+    col = db.collection(col_name)
+    for card in sorted(all_cards, key=lambda c: file_sums.get(c, 0) + zettle_sums.get(c, 0), reverse=True):
+        total = file_sums.get(card, 0.0) + zettle_sums.get(card, 0.0)
+        days_data = {
+            d: round(v, 2)
+            for d, v in sorted(zettle_days.get(card, {}).items())
+        }
+        payload = {
+            "sum": round(total, 2),
+            "days": days_data,  # empty {} if no Zettle data for this card
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        if dry_run:
+            click.echo(
+                f"  [DRY] {card}: file={file_sums.get(card, 0):.2f} "
+                f"zettle={zettle_sums.get(card, 0):.2f} "
+                f"total={payload['sum']:.2f} ({len(days_data)} day(s))"
+            )
+        else:
+            col.document(card).set(payload)
+            click.echo(f"  {card}: {payload['sum']:.2f} kr")
+
+    file_total = sum(file_sums.values())
+    zettle_total = sum(zettle_sums.values())
+    click.echo(
+        f"\nDone. {file_total:.2f} kr (file) + {zettle_total:.2f} kr (Zettle) = "
+        f"{(file_total + zettle_total):.2f} kr across {len(all_cards)} cards."
+    )
+
+
 def main() -> None:
     """Entry point for the CLI."""
     cli()
