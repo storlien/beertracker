@@ -8,13 +8,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from google.api_core.exceptions import ResourceExhausted
 
 from beertracker.api.client import ZettleClient
 from beertracker.api.token_manager import TokenManager
 from beertracker.config import get_settings
 from beertracker.core.mappers import aggregate_by_card, aggregate_by_card_and_day, parse_purchases
 from beertracker.firebase.client import get_firestore_client
-from beertracker.firebase.repositories import CardRepository, DailyUsageRepository, StateRepository
+from beertracker.firebase.repositories import CardRepository, DailyUsageRepository, StateRepository, StatsRepository
 from beertracker.services.daily_leaderboard_cache import DailyLeaderboardCache
 from beertracker.services.leaderboard_cache import LeaderboardCache
 from beertracker.services.leaderboard_repo import LeaderboardRepository
@@ -40,6 +41,7 @@ class SyncWorker:
         self._card_repo = CardRepository(self._db)
         self._daily_usage_repo = DailyUsageRepository(self._db)
         self._state_repo = StateRepository(self._db)
+        self._stats_repo = StatsRepository(self._db)
         self._leaderboard_repo = LeaderboardRepository(self._db)
         self._cache = LeaderboardCache(self._db, self._leaderboard_repo)
         self._daily_cache = DailyLeaderboardCache(self._db, self._leaderboard_repo)
@@ -47,6 +49,8 @@ class SyncWorker:
         self._scheduler = BackgroundScheduler()
         self._shutdown_event = threading.Event()
         self._sync_lock = threading.Lock()
+        self._stats_seed_lock = threading.Lock()
+        self._stats_seeded = False
 
         self._current_interval: int | None = None
         self._last_purchase_at: datetime | None = None
@@ -76,11 +80,25 @@ class SyncWorker:
             return
 
         try:
+            # Gate: never sync before info/stats is seeded, otherwise the
+            # first in-transaction stats write would create the document
+            # from zero and the historical totals would be lost forever.
+            if not self._stats_seeded:
+                self._try_seed_stats()
+                if not self._stats_seeded:
+                    logger.warning(
+                        "Sync deferred — info/stats not seeded yet (%s)",
+                        oslo_now_str(),
+                    )
+                    return
+
             current_hash = self._state_repo.get_last_purchase_hash()
             logger.info("Sync starting (%s)", oslo_now_str())
 
             total_purchases = 0
             total_cards_updated: set[str] = set()
+            total_delta_spent = 0.0
+            total_new_cards = 0
             page_count = 0
 
             while True:
@@ -99,7 +117,7 @@ class SyncWorker:
                 if purchases:
                     # Lifetime totals (existing)
                     card_totals = aggregate_by_card(purchases)
-                    self._card_repo.batch_increment_sums(
+                    _applied, _skipped, delta_spent, new_cards = self._card_repo.batch_increment_sums(
                         card_totals,
                         page_last_purchase_hash=current_hash or "",
                     )
@@ -113,6 +131,8 @@ class SyncWorker:
                             page_last_purchase_hash=current_hash or "",
                         )
 
+                    total_delta_spent += delta_spent
+                    total_new_cards += new_cards
                     total_cards_updated.update(card_totals.keys())
                     total_purchases += len(purchases)
 
@@ -137,6 +157,10 @@ class SyncWorker:
                     )
                     break
 
+            # Stats are updated atomically inside each card transaction
+            # (see _increment_card_transaction_body), so nothing to do
+            # here. total_delta_spent / total_new_cards are for logging.
+
             # Update lastSyncAt even when idle to show the service is alive.
             # Without this, healthcheck fails after 10 minutes of no bar sales.
             self._state_repo.update_sync_state(
@@ -153,10 +177,12 @@ class SyncWorker:
                 )
 
             logger.info(
-                "Sync done: %d purchases, %d cards, %d page(s) (%s)",
+                "Sync done: %d purchases, %d cards, %d page(s), +%.2f kr, +%d new card(s) (%s)",
                 total_purchases,
                 len(total_cards_updated),
                 page_count - 1,
+                total_delta_spent,
+                total_new_cards,
                 oslo_now_str(),
             )
 
@@ -218,6 +244,65 @@ class SyncWorker:
             except Exception:
                 logger.exception("Reschedule failed (%s)", oslo_now_str())
 
+    def _try_seed_stats(self) -> None:
+        """Seed ``info/stats`` via full recompute if the document is missing.
+
+        Idempotent and thread-safe. On Firestore quota errors the seeding
+        is deferred and retried by ``_job_retry_startup`` and the sync
+        gate.
+        """
+        if self._stats_seeded:
+            return
+        with self._stats_seed_lock:
+            if self._stats_seeded:
+                return
+            try:
+                if not self._stats_repo.exists():
+                    logger.info("info/stats missing — seeding via full recompute (one-time)")
+                    self._stats_repo.update_stats()
+                self._stats_seeded = True
+                logger.info("info/stats present and verified")
+            except ResourceExhausted:
+                logger.warning("Stats seeding deferred — Firestore quota exceeded")
+
+    def _job_retry_startup(self) -> None:
+        """Retry deferred startup tasks (stats seeding, cache listeners).
+
+        Runs periodically; everything it touches is idempotent, so it is
+        a cheap no-op once the service is fully started.
+        """
+        from beertracker.core.date_utils import oslo_now_str
+
+        try:
+            self._try_seed_stats()
+            if not self._cache.is_started:
+                self._cache.start()
+            if not self._daily_cache.is_started:
+                self._daily_cache.start()
+        except Exception:
+            logger.exception("Startup retry failed (%s)", oslo_now_str())
+
+    def _job_reconcile_stats(self) -> None:
+        """Daily reconciliation: recompute ``info/stats`` from ``cards``.
+
+        Corrects any drift (float error, out-of-band writes, lost deltas).
+        Scheduled at 05:00 UTC (~06/07:00 Oslo) when the bar is closed.
+        """
+        from beertracker.core.date_utils import oslo_now_str
+
+        try:
+            payload = self._stats_repo.update_stats()
+            logger.info(
+                "Stats reconciled: totalSpent=%.2f, totalCards=%d (%s)",
+                payload["totalSpent"],
+                payload["totalCards"],
+                oslo_now_str(),
+            )
+        except ResourceExhausted:
+            logger.warning("Stats reconciliation skipped — Firestore quota exceeded")
+        except Exception:
+            logger.exception("Stats reconciliation failed (%s)", oslo_now_str())
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -231,7 +316,10 @@ class SyncWorker:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self._signal_handler)
 
-        # Start leaderboard caches (attaches Firestore listeners)
+        # Seed info/stats if missing (idempotent; deferred on quota errors)
+        self._try_seed_stats()
+
+        # Start leaderboard caches (degrade gracefully on quota errors)
         self._cache.start()
         self._daily_cache.start()
 
@@ -260,6 +348,21 @@ class SyncWorker:
             "interval",
             seconds=60,  # Check mode every minute
             id=ADAPTIVE_CHECK_JOB_ID,
+            replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self._job_retry_startup,
+            "interval",
+            seconds=600,
+            id="retry_startup",
+            replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self._job_reconcile_stats,
+            "cron",
+            hour=5,
+            minute=0,
+            id="reconcile_stats",
             replace_existing=True,
         )
 

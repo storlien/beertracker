@@ -14,15 +14,37 @@ COLLECTION_CARDS = "cards"
 COLLECTION_INFO = "info"
 COLLECTION_DAILY_USAGE = "dailyUsage"
 DOC_STATE = "state"
+DOC_STATS = "stats"
 FIELD_LAST_PURCHASE_HASH = "lastPurchaseHash"
 FIELD_LAST_SYNC_AT = "lastSyncAt"
 FIELD_TOTAL_PAGES = "totalPagesSynced"
+FIELD_TOTAL_SPENT = "totalSpent"
+FIELD_TOTAL_CARDS = "totalCards"
+FIELD_UPDATED_AT = "updatedAt"
 
 
-def _increment_card_transaction(transaction, doc_ref, amount: float, page_hash: str) -> bool:
+def _increment_card_transaction_body(
+    transaction, doc_ref, stats_ref, amount: float, page_hash: str
+) -> tuple[bool, bool]:
     """Transaction body: read card, check page hash, increment if new.
 
     Defined at module level so the ``@transactional`` decorator works.
+
+    Updates the card document and the ``info/stats`` aggregate in the
+    SAME transaction, so the two can never diverge (e.g. on a crash
+    between two separate writes).
+
+    Args:
+        transaction: Firestore transaction handle.
+        doc_ref: Document reference for the card.
+        stats_ref: Document reference for ``info/stats``.
+        amount: Amount in kroner to add.
+        page_hash: The Zettle page hash used for idempotency.
+
+    Returns:
+        ``(applied, is_new_card)`` where ``applied`` is ``True`` if the
+        increment was written and ``is_new_card`` is ``True`` if the card
+        document did not exist before this transaction.
     """
     snapshot = doc_ref.get(transaction=transaction)
 
@@ -34,10 +56,12 @@ def _increment_card_transaction(transaction, doc_ref, amount: float, page_hash: 
                 doc_ref.id,
                 page_hash,
             )
-            return False
+            return False, False
         new_sum = (snapshot.to_dict().get("sum") or 0.0) + amount
+        is_new = False
     else:
         new_sum = amount
+        is_new = True
 
     now = datetime.now(timezone.utc)
     transaction.set(
@@ -50,6 +74,15 @@ def _increment_card_transaction(transaction, doc_ref, amount: float, page_hash: 
         },
         merge=True,
     )
+    transaction.set(
+        stats_ref,
+        {
+            FIELD_TOTAL_SPENT: _firestore_mod.Increment(amount),
+            FIELD_TOTAL_CARDS: _firestore_mod.Increment(1 if is_new else 0),
+            FIELD_UPDATED_AT: now,
+        },
+        merge=True,
+    )
     logger.debug(
         "Incremented card %s by +%.2f (page_hash=%s, new_sum=%.2f)",
         doc_ref.id,
@@ -57,11 +90,11 @@ def _increment_card_transaction(transaction, doc_ref, amount: float, page_hash: 
         page_hash,
         new_sum,
     )
-    return True
+    return True, is_new
 
 
 # Make it a proper Firestore transaction wrapper
-_increment_card_transaction = _firestore_mod.transactional(_increment_card_transaction)
+_increment_card_transaction = _firestore_mod.transactional(_increment_card_transaction_body)
 
 
 class CardRepository:
@@ -95,7 +128,7 @@ class CardRepository:
         card_number: str,
         amount: float,
         page_last_purchase_hash: str,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Atomically increment a card's sum, idempotent by page hash.
 
         Uses a Firestore transaction to read the card's current
@@ -109,18 +142,22 @@ class CardRepository:
                 Zettle API page that produced this increment.
 
         Returns:
-            ``True`` if the increment was applied; ``False`` if skipped
-            because this page was already processed for this card.
+            ``(applied, is_new_card)`` where ``applied`` is ``True`` if the
+            increment was written and ``is_new_card`` is ``True`` if the card
+            document did not exist before this transaction.
         """
         transaction = self._db.transaction()
         doc_ref = self._col.document(card_number)
-        return _increment_card_transaction(transaction, doc_ref, amount, page_last_purchase_hash)
+        stats_ref = self._db.collection(COLLECTION_INFO).document(DOC_STATS)
+        return _increment_card_transaction(
+            transaction, doc_ref, stats_ref, amount, page_last_purchase_hash
+        )
 
     def batch_increment_sums(
         self,
         card_totals: dict[str, float],
         page_last_purchase_hash: str,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], float, int]:
         """Increment sums for multiple cards, tracking idempotency per page.
 
         Args:
@@ -128,14 +165,21 @@ class CardRepository:
             page_last_purchase_hash: The Zettle page hash for this batch.
 
         Returns:
-            Tuple of (applied_card_ids, skipped_card_ids).
+            Tuple of (applied_card_ids, skipped_card_ids, delta_spent,
+            new_cards_count).
         """
         applied: list[str] = []
         skipped: list[str] = []
+        delta_spent = 0.0
+        new_cards = 0
 
         for card_number, amount in card_totals.items():
-            if self.increment_sum(card_number, amount, page_last_purchase_hash):
+            was_applied, is_new = self.increment_sum(card_number, amount, page_last_purchase_hash)
+            if was_applied:
                 applied.append(card_number)
+                delta_spent += amount
+                if is_new:
+                    new_cards += 1
             else:
                 skipped.append(card_number)
 
@@ -146,10 +190,14 @@ class CardRepository:
                 len(skipped),
                 page_last_purchase_hash,
             )
-        return applied, skipped
+        return applied, skipped, delta_spent, new_cards
 
     def upsert_sum(self, card_number: str, total: float) -> None:
         """Set or overwrite the sum for a card (used by CLI seeding).
+
+        Also recomputes ``info/stats`` so the aggregate stays consistent:
+        the in-transaction stats increment only covers sync-driven card
+        writes, not manual overwrites like this one.
 
         Args:
             card_number: 10-digit card identifier.
@@ -161,6 +209,7 @@ class CardRepository:
             merge=True,
         )
         logger.info("Upserted card %s sum=%.2f", card_number, total)
+        StatsRepository(self._db).update_stats()
 
     def get_all(self):
         """Iterate over all cards (generator)."""
@@ -310,6 +359,90 @@ class StateRepository:
         """Return the current state document as a dict."""
         doc = self._doc_ref.get()
         return doc.to_dict() or {}
+
+
+class StatsRepository:
+    """Repository for aggregated stats in Firestore.
+
+    Maintains a single document at ``info/stats`` with pre-computed
+    aggregates over the ``cards`` collection so the frontend can read
+    them in O(1) instead of scanning every card.
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+        self._doc_ref = db.collection(COLLECTION_INFO).document(DOC_STATS)
+
+    def exists(self) -> bool:
+        """Return ``True`` if the ``info/stats`` document exists."""
+        return self._doc_ref.get().exists
+
+    def increment_stats(self, delta_spent: float, new_cards: int) -> None:
+        """Atomically increment ``totalSpent`` and ``totalCards``.
+
+        Note: card increments made through ``CardRepository`` already
+        update ``info/stats`` within the same transaction. Calling this
+        in addition would double-count; use only for out-of-band
+        corrections.
+
+        Args:
+            delta_spent: Amount to add to ``totalSpent``.
+            new_cards: Number of new cards to add to ``totalCards``.
+        """
+        self._doc_ref.set(
+            {
+                FIELD_TOTAL_SPENT: _firestore_mod.Increment(delta_spent),
+                FIELD_TOTAL_CARDS: _firestore_mod.Increment(new_cards),
+                FIELD_UPDATED_AT: datetime.now(timezone.utc),
+            },
+            merge=True,
+        )
+        logger.info(
+            "Stats incremented: +%.2f spent, +%d card(s)",
+            delta_spent,
+            new_cards,
+        )
+
+    def update_stats(self) -> dict[str, Any]:
+        """Recompute and write ``totalSpent``, ``totalCards``, and ``updatedAt``.
+
+        This performs a full collection scan of ``cards``. It is used for
+        one-time seeding (when ``info/stats`` does not exist yet), daily
+        reconciliation, and after manual out-of-band writes. Normal sync
+        does not need it: card increments update stats in-transaction.
+
+        Uses ``merge=True`` so existing fields in the document are preserved.
+
+        Returns:
+            The dict that was written to Firestore.
+        """
+        total_spent = 0.0
+        total_cards = 0
+
+        for doc in self._db.collection(COLLECTION_CARDS).stream():
+            data = doc.to_dict() or {}
+            raw_sum = data.get("sum")
+            if isinstance(raw_sum, (int, float)):
+                total_spent += raw_sum
+            elif isinstance(raw_sum, str):
+                try:
+                    total_spent += float(raw_sum)
+                except ValueError:
+                    pass
+            total_cards += 1
+
+        payload: dict[str, Any] = {
+            FIELD_TOTAL_SPENT: round(total_spent, 2),
+            FIELD_TOTAL_CARDS: total_cards,
+            FIELD_UPDATED_AT: datetime.now(timezone.utc),
+        }
+        self._doc_ref.set(payload, merge=True)
+        logger.info(
+            "Stats recomputed: totalSpent=%.2f, totalCards=%d",
+            total_spent,
+            total_cards,
+        )
+        return payload
 
 
 def _parse_firestore_timestamp(value: Any) -> datetime | None:

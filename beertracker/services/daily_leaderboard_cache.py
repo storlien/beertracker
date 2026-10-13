@@ -4,6 +4,8 @@ import logging
 import threading
 from typing import Any
 
+from google.api_core.exceptions import ResourceExhausted
+
 from beertracker.core.leaderboard import compute_daily_leaderboard
 from beertracker.core.models import LeaderboardEntry, User
 
@@ -35,25 +37,47 @@ class DailyLeaderboardCache:
         self._daily_watch = None
         self._users_watch = None
         self._started = False
+        self._warmed = False
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
+    @property
+    def is_started(self) -> bool:
+        """Return ``True`` when listeners are attached and the cache is warm."""
+        return self._started
+
     def start(self) -> None:
-        """Attach Firestore listeners and warm the cache."""
+        """Attach Firestore listeners and warm the cache.
+
+        Degrades gracefully on Firestore quota errors: the cache stays
+        unstarted and ``SyncWorker`` retries via a periodic job. Other
+        errors propagate.
+        """
         if self._started:
             return
 
         logger.info("DailyLeaderboardCache: starting Firestore listeners...")
-        self._warm_cache()
 
-        self._daily_watch = self._db.collection(COLLECTION_DAILY_USAGE).on_snapshot(
-            self._on_daily_changed
-        )
-        self._users_watch = self._db.collection(COLLECTION_USERS).on_snapshot(
-            self._on_users_changed
-        )
+        try:
+            if not self._warmed:
+                self._warm_cache()
+                self._warmed = True
+            if self._daily_watch is None:
+                self._daily_watch = self._db.collection(COLLECTION_DAILY_USAGE).on_snapshot(
+                    self._on_daily_changed
+                )
+            if self._users_watch is None:
+                self._users_watch = self._db.collection(COLLECTION_USERS).on_snapshot(
+                    self._on_users_changed
+                )
+        except ResourceExhausted:
+            logger.warning(
+                "DailyLeaderboardCache: quota exceeded during startup — "
+                "starting degraded, will retry"
+            )
+            return
 
         self._started = True
         logger.info(
@@ -71,6 +95,7 @@ class DailyLeaderboardCache:
             self._users_watch.unsubscribe()
             self._users_watch = None
         self._started = False
+        self._warmed = False
         logger.info("DailyLeaderboardCache: listeners stopped")
 
     # ------------------------------------------------------------------

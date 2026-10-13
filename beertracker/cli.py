@@ -100,6 +100,24 @@ def seed_state(hash_file: str) -> None:
     click.echo("Done.")
 
 
+@cli.command("recompute-stats")
+def recompute_stats() -> None:
+    """Recompute info/stats (totalSpent, totalCards) from the cards collection.
+
+    Full collection scan — use for one-time seeding, reconciliation after
+    manual card edits, or to correct any drift in the incremental counter.
+    """
+    from beertracker.firebase.client import get_firestore_client
+    from beertracker.firebase.repositories import StatsRepository
+
+    db = get_firestore_client()
+    payload = StatsRepository(db).update_stats()
+    click.echo(
+        f"info/stats recomputed: totalSpent={payload['totalSpent']}, "
+        f"totalCards={payload['totalCards']}"
+    )
+
+
 @cli.command()
 @click.option("--collection", default="cards", help="Firestore collection to inspect")
 def inspect(collection: str) -> None:
